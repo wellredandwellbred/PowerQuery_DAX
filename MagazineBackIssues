@@ -1,0 +1,54 @@
+# Query Name: Magazine Back Issues
+
+# Purpose: Display magazine issues that are at least 1 year old that has a quantity greater than 100 for the purpose of 
+# depleting excess inventory in the warehouse. 
+
+# Query:
+
+let
+    LoadProducts = _Products,
+    FilterRows = Table.SelectRows(LoadProducts, each 
+    ([Category] = "MAGAZINE") 
+    and ([IsKit] <> "True")
+    and ([SubCategory] <> "MAG-Subscription")
+),
+    SelectColumns = Table.SelectColumns(FilterRows,{"MatID", "MatDesc", "Status"}),
+    AddIssue = Table.AddColumn(SelectColumns, "Issue", each let splitMatDesc = Splitter.SplitTextByCharacterTransition((c) => not List.Contains({"0".."9"}, c), {"0".."9"})([MatDesc]), splitMatDesc2 = Splitter.SplitTextByCharacterTransition({"0".."9"}, (c) => not List.Contains({"0".."9"}, c))([MatDesc]) in Text.Combine({splitMatDesc{1}?, Text.Middle(splitMatDesc2{1}?, 1)}), type text),
+    ReplaceValues = let
+    Source = AddIssue,
+    ReplaceValue1 = Table.ReplaceValue(AddIssue, "2 YearYear", null, Replacer.ReplaceValue, {"Issue"}),
+    ReplaceValue2 = Table.ReplaceValue(ReplaceValue1, "10)", null, Replacer.ReplaceValue, {"Issue"}),
+    ReplaceValue3 = Table.ReplaceValue(ReplaceValue2, "20 yr Vol yr Vol 20", "20.3", Replacer.ReplaceValue, {"Issue"})
+in
+    ReplaceValue3,
+    ChangeType = Table.TransformColumnTypes(ReplaceValues,{{"Issue", type number}}),
+    // Want to exclude issues from the last year (the 4 most recent issues)
+    FilterBackIssues = let
+    Source = Table.Sort(ChangeType,{{"MatID", Order.Ascending}}),
+    Current = Table.LastN(Source, 1)[Issue]{0}, 
+    BackIssue = Table.SelectRows(Source, each [Issue] <= (Current - 1.0))
+in
+    BackIssue,
+    Join110Inventory = Table.ExpandTableColumn(Table.NestedJoin(
+    FilterBackIssues, "MatID",
+    __Inventory, "MatID", "Nested", JoinKind.LeftOuter), "Nested", {"Location", "LogArea", "Qty"}),
+    NulltoZero = Table.ReplaceValue(Join110Inventory,null,0,Replacer.ReplaceValue,{"Qty"}),
+    AddLogAreaQty = Table.AddColumn(NulltoZero, "LogAreaQty", each [LogArea] & " [" & Text.From([Qty]) & "]", type text),
+    GroupMatIDDesc = Table.Group(AddLogAreaQty, {"MatID", "MatDesc"}, {
+    {"TotalQty", each List.Sum([Qty]), Int64.Type}
+    , {"RowData", each _, Value.Type(AddLogAreaQty)}
+}),
+    // One box holds 50 magazines. A single pallet holds about 68 boxes. 
+    FilterQty = Table.SelectRows(GroupMatIDDesc, each [TotalQty] > 100),
+    AddErrDetail = Table.AddColumn(FilterQty, "ErrDetail", each "Current quantity of " & Number.ToText([TotalQty]) & ". Issues are located in " & Text.Combine([RowData][LogAreaQty], ", ") & ".", type text),
+    AddPriority = Table.AddColumn(AddErrDetail, "Priority", each 
+    if [TotalQty] > 1000 then "1 - Urgent"
+    else if [TotalQty] > 250 then "2 - High"
+    else "3 - Low"
+, type text),
+    Summarize = Table.Group(AddPriority, {"MatID", "ErrDetail", "Priority"}, {
+    {"ErrGroup", each "MagInventory", type text},
+    {"ErrOwner", each "Magazine", type text}
+})
+in
+    Summarize
