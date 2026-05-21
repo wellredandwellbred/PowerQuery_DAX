@@ -1,0 +1,51 @@
+# Query Name: NoTransaction
+
+# Purpose: For products that are active and sent to retail (excluding Magazines and Curricula that are not BoM) and 
+# do not have open purchase orders, determine if there has been any POS transaction activity at the attractions and how long 
+# it has been since last transaction.
+
+# Query:
+let
+   LoadRetailProducts = _ActiveSendToRetail,
+   FilterProds = Table.SelectRows(LoadRetailProducts, each ([Status Purchasing] = "Active") and not ([Category] = "CURRICULA"  and not Text.Contains([MatDesc], "BM"))),
+   SelectProdCols = Table.SelectColumns(FilterProds,{"MatID", "MatDesc", "CreatedOn"}),
+   Today = Date.From(DateTime.FixedLocalNow()),
+   _____POSUsage_____ = null,
+   LoadPOSUsage = Table.SelectRows(__Usage, each ([Site] <> 1000) and ([Type] = "POS")),
+   SelectPOSCols = Table.SelectColumns(LoadPOSUsage, {"MatID", "Site", "Date", "Type", "Qty", "UsageGroup"}),
+   AddLastUse = Table.Group(SelectPOSCols, {"MatID"}, {
+     {"LastUse", each Duration.Days(Today - List.Max([Date])), Int64.Type}
+}),
+   _____PurchaseOrders_____ = null,
+    LoadOpenPO = Table.SelectRows(__PurchaseOrders, each List.Contains({"Sent", "Follow-Up Document Created"}, [StatusItem])),
+    GroupMatIDwithIncoming = Table.Group(LoadOpenPO, {"MatID"}, {{"Count", each Table.RowCount(_), Int64.Type}}),
+    _____Summarize_____ = GroupMatIDwithIncoming,
+   Join110Usage = Table.ExpandTableColumn(Table.NestedJoin(
+       SelectProdCols, "MatID", 
+       AddLastUse, "MatID", "Nested", JoinKind.LeftOuter
+), "Nested", {"LastUse"}),
+    Join110TotalQty = Table.ExpandTableColumn(Table.NestedJoin(
+    Join110Usage, "MatID",
+    _TotalQty, "MatID", "Nested", JoinKind.LeftOuter
+), "Nested", {"TotalQty"}),
+    RemoveNewProducts = Table.SelectRows(Join110TotalQty, each not ( ([LastUse] = null) and ([TotalQty] = null) )),
+    FilterLastUse = Table.SelectRows(RemoveNewProducts, each [LastUse] = null or [LastUse] > 30),
+    Join100RemoveIncoming = Table.NestedJoin(
+    FilterLastUse, "MatID",
+    GroupMatIDwithIncoming, "MatID"
+, "Nested", JoinKind.LeftAnti),
+    AddErrDetail = Table.AddColumn(Join100RemoveIncoming, "ErrDetail", each 
+    if [LastUse] = null then "Active retail product with no POS data and total inventory of " & Number.ToText([TotalQty]) & "." 
+    else if [TotalQty] = null then "Active retail product with no inventory and last POS transaction was " & Number.ToText([LastUse]) & " days ago."
+    else "Active retail product with no POS transactions in last " & Number.ToText([LastUse]) & " days.", type text),
+    AddPriority = Table.AddColumn(AddErrDetail, "Priority", each 
+   if [LastUse] = null or [LastUse] > 545 then "1 - Urgent" // over a year and a half
+   else if [TotalQty] = null or [LastUse] > 180 then "2 - High" // over 6 months
+   else "3 - Low"
+, type text),
+   Summarize = Table.Group(AddPriority, {"MatID", "ErrDetail", "Priority"}, {
+    {"ErrGroup", each "NoTransaction", type text},
+    {"ErrOwner", each "Retail", type text}
+})
+in
+    Summarize
