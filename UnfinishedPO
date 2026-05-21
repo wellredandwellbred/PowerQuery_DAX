@@ -1,0 +1,50 @@
+# Query Name: UnfinishedPO
+
+# Purpose: For all products, determine if product has no open Purchase Orders but there is still incoming 
+# stock indicated in SupplyDemand. For all products, determine if there are open POs where the delivered 
+# quantity and the invoiced quantity are not equal.
+
+# Query:
+let
+    LoadPO = __PurchaseOrders,
+    RemoveUnapprovedPO = Table.SelectRows(LoadPO, each 
+    List.Contains({"Finished", "Follow-Up Document Created", "Acknowledgement Received", "Sent"}, [Status]) //active PO
+    and [MatID] < 5000000 // remove services
+),
+    _____Inventory_____ = null 
+,
+    GroupProduct = Table.Group(RemoveUnapprovedPO, {"MatID", "MatDesc"}, {
+    {"RowData", each _, Value.Type(RemoveUnapprovedPO)},
+    {"Statuses", each Text.Combine(List.Sort(List.Distinct([Status])), ", "), type text},
+    {"RecentBuyer", each Table.Sort(_, {"DateOrdered", Order.Descending})[Buyer]{0}, type text}
+}),
+    Join110SD = Table.ExpandTableColumn(Table.NestedJoin(
+    GroupProduct, "MatID",
+    Table.SelectRows(__SupplyDemand, each [SubTotal]="Supply"), "MatID"
+, "Nested", JoinKind.LeftOuter), "Nested", {"KeyFigure", "Qty"}),
+    FilterSD = Table.SelectRows(Join110SD, each 
+[KeyFigure] <> null and [Qty] <> null   //has no incoming inventory
+and [Statuses] = "Finished"             //all POs are finished, removing products that still have open POs
+),
+    AddInvErrDetail = Table.AddColumn(FilterSD, "ErrDetail", each "ATTN: " & [RecentBuyer] & " - Product has no open PO but shows " & Number.ToText([Qty]) & " incoming in SupplyDemand.", type text),
+    SummarizeInv = Table.Group(AddInvErrDetail, {"MatID", "ErrDetail"}, {
+    {"ErrGroup", each "UnfinishedPO", type text},
+    {"Priority", each "1 - Urgent", type text}
+}),
+    _____Money_____ = null,
+    FilterMonErr = Table.SelectRows(RemoveUnapprovedPO, each 
+    (List.Contains({"In Process", "Not Relevant"}, [StatusDeliveryProcessing]) and [QtyDelivered]<>[QtyInvoiced])
+    or ([Status]<>"Finished" and [QtyDelivered]>0 and [StatusInvoiceProcessing]="Not Started")
+),
+    AddPOAge = let Today = Date.From(DateTime.FixedLocalNow())
+in Table.AddColumn(FilterMonErr, "POAge", each Duration.Days(Today - [DateCreated]), Int64.Type),
+    FilterL31Days = Table.SelectRows(AddPOAge, each [POAge] > 30),
+    AddMonErrDetail = Table.AddColumn(FilterL31Days, "ErrDetail", each "ATTN: " & [Buyer] & " - Product has qty of " & Number.ToText([Qty]) & " on open PO " & Number.ToText([OrderID]) & ", which is " & Number.ToText([POAge]) & " days old. " & Number.ToText([QtyDelivered]) & " have been delivered, but " & Number.ToText([QtyInvoiced]) & " have been invoiced.", type text),
+    SummarizeMon = Table.Group(AddMonErrDetail, {"MatID", "ErrDetail"}, {
+    {"ErrGroup", each "UnfinishedPO", type text},
+    {"Priority", each "2 - High", type text}
+}),
+    _____Combine_____ = null,
+    AppendSummaries = Table.AddColumn(SummarizeInv & SummarizeMon, "ErrOwner", each "Retail", type text)
+in
+    AppendSummaries
