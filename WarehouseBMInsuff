@@ -1,0 +1,31 @@
+# Query Name: WHMinBoMInsuff
+
+# Purpose: For each active bill of material, calculate the total min at the warehouse (MinSupply) and 
+# the total of the max's across logistics areas for the attractions (MaxDemand). Determine if the 
+# warehouse Min is greater than combined attraction Max.
+
+# Query:
+let
+    LoadMinMax = __MinMaxSAP,
+    Join110Products = Table.ExpandTableColumn(Table.NestedJoin(
+    LoadMinMax, "MatID", 
+    _Products, "MatID", "Nested", JoinKind.LeftOuter), "Nested", {"Status", "IsBom"}),
+    // Using [Status] instead of [Status Sales] b/c we don't want to store discontinued BoMs as we try selling through them.
+    FilterActiveandBoM = Table.SelectRows(Join110Products, each ([Status] = "Active") and ([IsBom] = true)),
+    GroupMatID = Table.Group(FilterActiveandBoM, {"MatID"}, {
+    {"MaxDemand", each List.Sum(Table.SelectRows(_, each [Site] <> 1000)[Max]), Int64.Type},
+    {"MinSupply", each List.Sum(Table.SelectRows(_, each [Site] = 1000)[Min]), Int64.Type}
+}),
+    FilterErr = Table.SelectRows(GroupMatID, each [MaxDemand] > [MinSupply]),
+    AddErrDetail = Table.AddColumn(FilterErr, "ErrDetail", each "For this BoM, warehouse Min is " & Number.ToText([MinSupply]) & ", attractions Max is " & Number.ToText([MaxDemand]), type text),
+    AddPriority = Table.AddColumn(AddErrDetail, "Priority", each 
+    if [MaxDemand] > 5*[MinSupply] then "1 - Urgent"
+    else if [MaxDemand] > 2*[MinSupply] then "2 - High"
+    else "3 - Low"
+, type text),
+    Summarize = Table.Group(AddPriority, {"MatID", "ErrDetail", "Priority"}, {
+    {"ErrGroup", each "WHMinBoMInsuff", type text},
+    {"ErrOwner", each "Warehouse", type text}
+})
+in
+    Summarize
